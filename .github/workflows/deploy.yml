@@ -1,0 +1,86 @@
+name: Build and deploy db-service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'db-service/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  IMAGE_NAME: db-service
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  CONTAINERAPP_NAME: ${{ vars.CONTAINERAPP_NAME || 'dbservice-api' }}
+  CONTAINERAPP_ENV: ${{ vars.CONTAINERAPP_ENV }}
+  POSTGRES_FQDN: ${{ vars.POSTGRES_FQDN }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in ACR
+        run: |
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "$IMAGE_NAME:${{ github.sha }}" \
+            --image "$IMAGE_NAME:latest" \
+            ./db-service
+
+      - name: Fetch ACR admin credentials
+        id: acr-creds
+        run: |
+          az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null
+          echo "username=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)" >> "$GITHUB_OUTPUT"
+          echo "password=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update Container App
+        run: |
+          DATABASE_URL="postgresql+psycopg2://${{ secrets.POSTGRES_ADMIN_LOGIN }}:${{ secrets.POSTGRES_ADMIN_PASSWORD }}@${POSTGRES_FQDN}:5432/appdb?sslmode=require"
+          IMAGE="$(az acr show -n "$ACR_NAME" --query loginServer -o tsv)/$IMAGE_NAME:${{ github.sha }}"
+
+          if az containerapp show -g "$RESOURCE_GROUP" -n "$CONTAINERAPP_NAME" >/dev/null 2>&1; then
+            az containerapp update \
+              -g "$RESOURCE_GROUP" \
+              -n "$CONTAINERAPP_NAME" \
+              --image "$IMAGE" \
+              --set-env-vars "DATABASE_URL=secretref:database-url"
+            az containerapp secret set \
+              -g "$RESOURCE_GROUP" \
+              -n "$CONTAINERAPP_NAME" \
+              --secrets "database-url=$DATABASE_URL"
+          else
+            az containerapp create \
+              -g "$RESOURCE_GROUP" \
+              -n "$CONTAINERAPP_NAME" \
+              --environment "$CONTAINERAPP_ENV" \
+              --image "$IMAGE" \
+              --target-port 8000 \
+              --ingress external \
+              --min-replicas 1 \
+              --max-replicas 3 \
+              --registry-server "$(az acr show -n "$ACR_NAME" --query loginServer -o tsv)" \
+              --registry-username "${{ steps.acr-creds.outputs.username }}" \
+              --registry-password "${{ steps.acr-creds.outputs.password }}" \
+              --secrets "database-url=$DATABASE_URL" \
+              --env-vars "DATABASE_URL=secretref:database-url"
+          fi
+
+      - name: Show app URL
+        run: |
+          az containerapp show -g "$RESOURCE_GROUP" -n "$CONTAINERAPP_NAME" \
+            --query "properties.configuration.ingress.fqdn" -o tsv
